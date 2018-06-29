@@ -32,7 +32,7 @@ use render_backend::FrameId;
 use render_task::{RenderTaskCache, RenderTaskCacheKey, RenderTaskId};
 use render_task::{RenderTaskCacheEntry, RenderTaskCacheEntryHandle, RenderTaskTree};
 use std::collections::hash_map::Entry::{self, Occupied, Vacant};
-use std::collections::hash_map::IterMut;
+use std::collections::hash_map::ValuesMut;
 use std::cmp;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -208,6 +208,10 @@ where
         self.resources.insert(key, value);
     }
 
+    pub fn remove(&mut self, key: &K) {
+        self.resources.remove(key);
+    }
+
     pub fn get_mut(&mut self, key: &K) -> &mut V {
         self.resources.get_mut(key)
             .expect("Didn't find a cached resource with that ID!")
@@ -221,8 +225,8 @@ where
         self.resources.entry(key)
     }
 
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
-        self.resources.iter_mut()
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+        self.resources.values_mut()
     }
 
     pub fn clear(&mut self) {
@@ -251,6 +255,13 @@ where
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+struct CachedImageKey {
+    pub rendering: ImageRendering,
+    pub tile: Option<TileOffset>,
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "capture", derive(Serialize))]
@@ -280,6 +291,15 @@ impl Into<BlobImageRequest> for ImageRequest {
     }
 }
 
+impl Into<CachedImageKey> for ImageRequest {
+    fn into(self) -> CachedImageKey {
+        CachedImageKey {
+            rendering: self.rendering,
+            tile: self.tile,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "capture", derive(Clone, Serialize))]
 #[cfg_attr(feature = "replay", derive(Deserialize))]
@@ -287,7 +307,8 @@ pub enum ImageCacheError {
     OverLimitSize,
 }
 
-type ImageCache = ResourceClassCache<ImageRequest, Result<CachedImageInfo, ImageCacheError>, ()>;
+type TiledImageCache = ResourceClassCache<CachedImageKey, CachedImageInfo, ()>;
+type ImageCache = ResourceClassCache<ImageKey, Result<TiledImageCache, ImageCacheError>, ()>;
 pub type FontInstanceMap = Arc<RwLock<FastHashMap<FontInstanceKey, FontInstance>>>;
 
 #[derive(Default)]
@@ -571,29 +592,10 @@ impl ResourceCache {
         }
 
         // Each cache entry stores its own copy of the image's dirty rect. This allows them to be
-        // updated independently. If we are tiling we need to scan the whole cache otherwise there
-        // is a finite number of keys.
-        // TODO(aosmond): We should consider changing how we store tiled entries to avoid O(N * M)
-        // complexity, where N is the number of updates, and M is the number of cached entries.
-        if tiling.is_some() {
-            for (request, entry) in self.cached_images.iter_mut() {
-                if request.tile.is_some() && request.key == image_key {
-                    if let Ok(ref mut entry) = *entry {
-                        entry.dirty_rect = merge_dirty_rect(entry.dirty_rect, dirty_rect, descriptor);
-                    }
-                }
-            }
-        } else {
-            for &render in &[ImageRendering::Auto, ImageRendering::CrispEdges, ImageRendering::Pixelated] {
-                let request = ImageRequest {
-                    key: image_key,
-                    rendering: render,
-                    tile: None
-                };
-
-                if let Some(&mut Ok(ref mut entry)) = self.cached_images.try_get_mut(&request) {
-                    entry.dirty_rect = merge_dirty_rect(entry.dirty_rect, dirty_rect, descriptor);
-                }
+        // updated independently.
+        if let Some(&mut Ok(ref mut entries)) = self.cached_images.try_get_mut(&image_key) {
+            for entry in entries.values_mut() {
+                entry.dirty_rect = merge_dirty_rect(entry.dirty_rect, dirty_rect, descriptor);
             }
         }
 
@@ -608,8 +610,7 @@ impl ResourceCache {
     pub fn delete_image_template(&mut self, image_key: ImageKey) {
         let value = self.resources.image_templates.remove(image_key);
 
-        self.cached_images
-            .clear_keys(|request| request.key == image_key);
+        self.cached_images.remove(&image_key);
 
         match value {
             Some(image) => if image.data.is_blob() {
@@ -650,39 +651,30 @@ impl ResourceCache {
             // The image or tiling size is too big for hardware texture size.
             warn!("Dropping image, image:(w:{},h:{}, tile:{}) is too big for hardware!",
                   template.descriptor.size.width, template.descriptor.size.height, template.tiling.unwrap_or(0));
-            self.cached_images.insert(request, Err(ImageCacheError::OverLimitSize));
+            self.cached_images.insert(request.key, Err(ImageCacheError::OverLimitSize));
             return;
         }
 
         // If this image exists in the texture cache, *and* the dirty rect
         // in the cache is empty, then it is valid to use as-is.
-        let (entry, needs_update) = match self.cached_images.entry(request) {
-            Occupied(entry) => {
-                let info = entry.into_mut();
-                let needs_update = info.as_ref().unwrap().dirty_rect.is_some();
-                (info, needs_update)
-            }
-            Vacant(entry) => (
-                entry.insert(Ok(
-                    CachedImageInfo {
-                        texture_cache_handle: TextureCacheHandle::new(),
-                        dirty_rect: None,
-                    }
-                )),
-                true,
-            ),
-        };
+        let entry = self.cached_images.entry(request.key)
+            .or_insert(Ok(ResourceClassCache::new()))
+            .as_mut().unwrap().entry(request.into())
+            .or_insert(CachedImageInfo {
+                texture_cache_handle: TextureCacheHandle::new(),
+                dirty_rect: Some(template.descriptor.full_rect()),
+            });
 
         let needs_upload = self.texture_cache
-            .request(&entry.as_ref().unwrap().texture_cache_handle, gpu_cache);
+            .request(&entry.texture_cache_handle, gpu_cache);
 
         let dirty_rect = if needs_upload {
             // the texture cache entry has been evicted, treat it as all dirty
             None
-        } else if needs_update {
-            entry.as_ref().unwrap().dirty_rect
-        } else {
+        } else if entry.dirty_rect.is_none() {
             return
+        } else {
+            entry.dirty_rect
         };
 
         if !self.pending_image_requests.insert(request) {
@@ -708,7 +700,7 @@ impl ResourceCache {
                     if let Some(dirty) = dirty_rect {
                         if intersect_for_tile(dirty, actual_size, tile_size, tile_offset).is_none() {
                             // don't bother requesting unchanged tiles
-                            entry.as_mut().unwrap().dirty_rect.take();
+                            entry.dirty_rect.take();
                             self.pending_image_requests.remove(&request);
                             return
                         }
@@ -892,8 +884,9 @@ impl ResourceCache {
 
         // TODO(Jerry): add a debug option to visualize the corresponding area for
         // the Err() case of CacheItem.
-        match *self.cached_images.get(&request) {
-            Ok(ref image_info) => {
+        match *self.cached_images.get(&request.key) {
+            Ok(ref entries) => {
+                let image_info = entries.get(&request.into());
                 Ok(self.texture_cache.get(&image_info.texture_cache_handle))
             }
             Err(_) => {
@@ -1015,7 +1008,7 @@ impl ResourceCache {
                 }
             };
 
-            let entry = self.cached_images.get_mut(&request).as_mut().unwrap();
+            let entry = self.cached_images.get_mut(&request.key).as_mut().unwrap().get_mut(&request.into());
             let mut descriptor = image_template.descriptor.clone();
             let local_dirty_rect;
 
@@ -1122,7 +1115,7 @@ impl ResourceCache {
             .images
             .retain(|key, _| key.0 != namespace);
         self.cached_images
-            .clear_keys(|request| request.key.0 == namespace);
+            .clear_keys(|key| key.0 == namespace);
 
         self.resources.font_instances
             .write()
