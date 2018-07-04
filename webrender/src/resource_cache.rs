@@ -33,7 +33,7 @@ use render_task::{RenderTaskCache, RenderTaskCacheKey, RenderTaskId};
 use render_task::{RenderTaskCacheEntry, RenderTaskCacheEntryHandle, RenderTaskTree};
 use std::collections::hash_map::Entry::{self, Occupied, Vacant};
 use std::collections::hash_map::ValuesMut;
-use std::cmp;
+use std::{cmp, mem};
 use std::fmt::Debug;
 use std::hash::Hash;
 #[cfg(any(feature = "capture", feature = "replay"))]
@@ -280,6 +280,10 @@ impl ImageRequest {
             tile: Some(offset),
         }
     }
+
+    pub fn is_untiled_auto(&self) -> bool {
+        self.tile.is_none() && self.rendering == ImageRendering::Auto
+    }
 }
 
 impl Into<BlobImageRequest> for ImageRequest {
@@ -307,8 +311,15 @@ pub enum ImageCacheError {
     OverLimitSize,
 }
 
-type TiledImageCache = ResourceClassCache<CachedImageKey, CachedImageInfo, ()>;
-type ImageCache = ResourceClassCache<ImageKey, Result<TiledImageCache, ImageCacheError>, ()>;
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+enum ImageResult {
+    UntiledAuto(CachedImageInfo),
+    Multi(ResourceClassCache<CachedImageKey, CachedImageInfo, ()>),
+    Err(ImageCacheError),
+}
+
+type ImageCache = ResourceClassCache<ImageKey, ImageResult, ()>;
 pub type FontInstanceMap = Arc<RwLock<FastHashMap<FontInstanceKey, FontInstance>>>;
 
 #[derive(Default)]
@@ -593,9 +604,17 @@ impl ResourceCache {
 
         // Each cache entry stores its own copy of the image's dirty rect. This allows them to be
         // updated independently.
-        if let Some(&mut Ok(ref mut entries)) = self.cached_images.try_get_mut(&image_key) {
-            for entry in entries.values_mut() {
-                entry.dirty_rect = merge_dirty_rect(entry.dirty_rect, dirty_rect, descriptor);
+        if let Some(ref mut entries) = self.cached_images.try_get_mut(&image_key) {
+            match entries {
+                ImageResult::UntiledAuto(ref mut entry) => {
+                    entry.dirty_rect = merge_dirty_rect(entry.dirty_rect, dirty_rect, descriptor);
+                }
+                ImageResult::Multi(ref mut entries) => {
+                    for entry in entries.values_mut() {
+                        entry.dirty_rect = merge_dirty_rect(entry.dirty_rect, dirty_rect, descriptor);
+                    }
+                }
+                ImageResult::Err(_) => {}
             }
         }
 
@@ -651,19 +670,64 @@ impl ResourceCache {
             // The image or tiling size is too big for hardware texture size.
             warn!("Dropping image, image:(w:{},h:{}, tile:{}) is too big for hardware!",
                   template.descriptor.size.width, template.descriptor.size.height, template.tiling.unwrap_or(0));
-            self.cached_images.insert(request.key, Err(ImageCacheError::OverLimitSize));
+            self.cached_images.insert(request.key, ImageResult::Err(ImageCacheError::OverLimitSize));
             return;
         }
 
+        let storage = match self.cached_images.entry(request.key) {
+            Occupied(e) => {
+                // We might have an existing untiled entry, and need to insert
+                // a second entry. In such cases we need to move the old entry
+                // out first, replacing it with a dummy entry, and then creating
+                // the tiled/multi-entry variant.
+                let entry = e.into_mut();
+                if !request.is_untiled_auto() {
+                    let untiled_entry = if let ImageResult::UntiledAuto(ref mut entry) = entry {
+                        Some(mem::replace(entry, CachedImageInfo {
+                            texture_cache_handle: TextureCacheHandle::new(),
+                            dirty_rect: None,
+                        }))
+                    } else {
+                        None
+                    };
+
+                    if let Some(untiled_entry) = untiled_entry {
+                        let mut entries = ResourceClassCache::new();
+                        let untiled_key = CachedImageKey {
+                            rendering: ImageRendering::Auto,
+                            tile: None,
+                        };
+                        entries.insert(untiled_key, untiled_entry);
+                        *entry = ImageResult::Multi(entries);
+                    }
+                }
+                entry
+            }
+            Vacant(entry) => {
+                entry.insert(if request.is_untiled_auto() {
+                    ImageResult::UntiledAuto(CachedImageInfo {
+                        texture_cache_handle: TextureCacheHandle::new(),
+                        dirty_rect: Some(template.descriptor.full_rect()),
+                    })
+                } else {
+                    ImageResult::Multi(ResourceClassCache::new())
+                })
+            }
+        };
+
         // If this image exists in the texture cache, *and* the dirty rect
         // in the cache is empty, then it is valid to use as-is.
-        let entry = self.cached_images.entry(request.key)
-            .or_insert(Ok(ResourceClassCache::new()))
-            .as_mut().unwrap().entry(request.into())
-            .or_insert(CachedImageInfo {
-                texture_cache_handle: TextureCacheHandle::new(),
-                dirty_rect: Some(template.descriptor.full_rect()),
-            });
+        let entry = match storage {
+            ImageResult::UntiledAuto(ref mut entry) => entry,
+            ImageResult::Multi(ref mut entries) => {
+                entries.entry(request.into())
+                    .or_insert(CachedImageInfo {
+                        texture_cache_handle: TextureCacheHandle::new(),
+                        dirty_rect: Some(template.descriptor.full_rect()),
+                    })
+            },
+            ImageResult::Err(_) => panic!("Errors should already have been handled"),
+        };
 
         let needs_upload = self.texture_cache
             .request(&entry.texture_cache_handle, gpu_cache);
@@ -885,11 +949,14 @@ impl ResourceCache {
         // TODO(Jerry): add a debug option to visualize the corresponding area for
         // the Err() case of CacheItem.
         match *self.cached_images.get(&request.key) {
-            Ok(ref entries) => {
+            ImageResult::UntiledAuto(ref image_info) => {
+                Ok(self.texture_cache.get(&image_info.texture_cache_handle))
+            }
+            ImageResult::Multi(ref entries) => {
                 let image_info = entries.get(&request.into());
                 Ok(self.texture_cache.get(&image_info.texture_cache_handle))
             }
-            Err(_) => {
+            ImageResult::Err(_) => {
                 Err(())
             }
         }
@@ -1008,7 +1075,11 @@ impl ResourceCache {
                 }
             };
 
-            let entry = self.cached_images.get_mut(&request.key).as_mut().unwrap().get_mut(&request.into());
+            let entry = match self.cached_images.get_mut(&request.key) {
+                ImageResult::UntiledAuto(ref mut entry) => entry,
+                ImageResult::Multi(ref mut entries) => entries.get_mut(&request.into()),
+                ImageResult::Err(_) => panic!("Update requested for invalid entry")
+            };
             let mut descriptor = image_template.descriptor.clone();
             let local_dirty_rect;
 
